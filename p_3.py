@@ -24,21 +24,21 @@ from torch.utils.data import random_split
 from imports.ABIDEDataset import ABIDEDataset
 
 EPS = 1e-10
-device = torch.device("cuda")
+device = torch.device("cuda:2")
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 # ======================= 模型定义 =======================
 # 消融顺序:
-# M0: baseline           — 纯 GCN
-# M1: gcn_gater          — GCN + LLM Feature Gater（无 HCGPool）
-# M2: gcn_pool_reg       — GCN + HCGPool + Reg（无 Gater）
-# M3: gcn_gater_pool_reg — GCN + Gater + HCGPool + Reg（全组件）
+# M0: baseline          — 纯 GCN
+# M1: gcn_gater         — GCN + LLM Feature Gater（无 HCGPool）
+# M2: gcn_pool_reg      — GCN + HCGPool + Reg（无 Gater）
+# M3: gcn_gater_pool_reg— GCN + Gater + HCGPool + Reg（全组件）
 
 
 class LLMFeatureGater(nn.Module):
-    """Transformer-based 特征门控模块"""
+    """Transformer-based 特征门控模块（名称沿用，实为轻量 Transformer Encoder）"""
     def __init__(self, indim, hidden_dim=96, n_layers=1, n_heads=2, dropout=0.5):
         super().__init__()
         self.proj = nn.Linear(indim, hidden_dim)
@@ -52,16 +52,17 @@ class LLMFeatureGater(nn.Module):
         self.gate_head = nn.Linear(hidden_dim, indim)
 
     def forward(self, x, batch):
-        x_seq = self.proj(x).unsqueeze(0)           # [1, N, hidden_dim]
-        h = self.encoder(x_seq).squeeze(0)           # [N, hidden_dim]
-        gate = torch.sigmoid(self.gate_head(h))      # [N, indim]
-        scale = 0.5 + 0.5 * gate                     # (0.5, 1.0)
+        # x: [N, indim]，所有图的节点拼在一起
+        x_seq = self.proj(x).unsqueeze(0)          # [1, N, hidden_dim]
+        h = self.encoder(x_seq).squeeze(0)          # [N, hidden_dim]
+        gate = torch.sigmoid(self.gate_head(h))     # [N, indim], in (0,1)
+        scale = 0.5 + 0.5 * gate                    # scale in (0.5, 1.0)
         x_gated = x * scale
         return x_gated, gate
 
 
 class HCGPool(nn.Module):
-    """层次化聚类图池化"""
+    """层次化聚类图池化（Hierarchical Cluster Graph Pooling）"""
     def __init__(self, in_channels, num_clusters, temp=1.0):
         super().__init__()
         self.in_channels = in_channels
@@ -102,8 +103,10 @@ class HCGPool(nn.Module):
                 ptr += ni
 
         s_batched = s_batched.clamp(min=EPS)
+        # 超节点特征: S^T X
         x_super = torch.bmm(s_batched.transpose(1, 2), x_batched).view(-1, self.in_channels)
 
+        # 超节点邻接: S^T A S，对称化后行归一化
         adj_super = torch.bmm(torch.bmm(s_batched.transpose(1, 2), adj), s_batched)
         for i in range(adj_super.size(0)):
             Ai = adj_super[i]
@@ -153,18 +156,22 @@ class BaselineGCN(nn.Module):
         x_out = F.relu(self.bn_fc1(self.fc1(x_readout)))
         x_out = F.dropout(x_out, p=self.dropout_p, training=self.training)
         x_out = self.fc2(x_out)
-        return F.log_softmax(x_out, dim=-1)   # 返回: output
+        output = F.log_softmax(x_out, dim=-1)
+        return output   # 返回: output
 
 
 # ---- M1 ----
 class GCN_Gater(nn.Module):
-    """M1: GCN + LLM Feature Gater（无 HCGPool，无残差）"""
+    """M1: GCN + LLM Feature Gater（无 HCGPool，无残差，与M0对齐以隔离Gater的贡献）"""
     def __init__(self, indim, nclass, hidden=64, dropout=0.65,
                  llm_hidden=96, llm_layers=1, llm_heads=2, llm_dropout=0.5):
         super().__init__()
         self.llm_gater = LLMFeatureGater(
-            indim=indim, hidden_dim=llm_hidden,
-            n_layers=llm_layers, n_heads=llm_heads, dropout=llm_dropout
+            indim=indim,
+            hidden_dim=llm_hidden,
+            n_layers=llm_layers,
+            n_heads=llm_heads,
+            dropout=llm_dropout
         )
         self.conv0 = GCNConv(indim, hidden)
         self.bn0 = nn.BatchNorm1d(hidden)
@@ -192,24 +199,26 @@ class GCN_Gater(nn.Module):
         x_out = F.relu(self.bn_fc1(self.fc1(x_readout)))
         x_out = F.dropout(x_out, p=self.dropout_p, training=self.training)
         x_out = self.fc2(x_out)
-        return F.log_softmax(x_out, dim=-1), gate   # 返回: output, gate
+        output = F.log_softmax(x_out, dim=-1)
+        return output, gate   # 返回: output, gate
 
 
 # ---- M2 ----
 class GCN_Pool_Reg(nn.Module):
-    """M2: GCN + HCGPool + Reg（无 Gater）"""
+    """M2: GCN + HCGPool + Reg（无 Gater，验证池化+正则本身的贡献）"""
     def __init__(self, indim, nclass, num_clusters=8,
                  dropout=0.65, hidden=64, pool_temp=1.0):
         super().__init__()
         self.num_clusters = num_clusters
         self.dropout_p = dropout
+        self.hidden = hidden
 
         self.conv0 = GCNConv(indim, hidden)
         self.bn0 = nn.BatchNorm1d(hidden)
         self.conv1 = GCNConv(hidden, hidden)
         self.bn1 = nn.BatchNorm1d(hidden)
 
-        self.pool1 = HCGPool(hidden, num_clusters=num_clusters, temp=pool_temp)
+        self.pool1 = HCGPool(hidden, num_clusters=self.num_clusters, temp=pool_temp)
 
         self.conv2 = GCNConv(hidden, hidden)
         self.bn2 = nn.BatchNorm1d(hidden)
@@ -225,7 +234,7 @@ class GCN_Pool_Reg(nn.Module):
         x = F.relu(x)
         x = F.dropout(x, p=self.dropout_p, training=self.training)
 
-        # GCN Layer 1（残差，与 M3 结构对齐）
+        # GCN Layer 1（带残差，与M3保持结构对齐）
         x1 = x
         x = self.conv1(x, edge_index, edge_attr)
         x = self.bn1(x)
@@ -239,7 +248,7 @@ class GCN_Pool_Reg(nn.Module):
         x_pooled, edge_index_pooled, edge_attr_pooled, batch_pooled, s_matrix = \
             self.pool1(x, edge_index, edge_attr, batch)
 
-        # GCN Layer 2（池化后，残差）
+        # GCN Layer 2（池化后，带残差）
         x_pooled_in = x_pooled
         x_pooled = self.conv2(x_pooled, edge_index_pooled, edge_attr_pooled)
         x_pooled = self.bn2(x_pooled)
@@ -251,7 +260,9 @@ class GCN_Pool_Reg(nn.Module):
         x_out = F.relu(self.bn_fc1(self.fc1(x_readout)))
         x_out = F.dropout(x_out, p=self.dropout_p, training=self.training)
         x_out = self.fc2(x_out)
-        return F.log_softmax(x_out, dim=-1), s_matrix, x_conv   # 返回: output, s_matrix, x_conv
+        output = F.log_softmax(x_out, dim=-1)
+
+        return output, s_matrix, x_conv   # 返回: output, s_matrix, x_conv
 
 
 # ---- M3 ----
@@ -263,10 +274,14 @@ class GCN_Gater_Pool_Reg(nn.Module):
         super().__init__()
         self.num_clusters = num_clusters
         self.dropout_p = dropout
+        self.hidden = hidden
 
         self.llm_gater = LLMFeatureGater(
-            indim=indim, hidden_dim=llm_hidden,
-            n_layers=llm_layers, n_heads=llm_heads, dropout=llm_dropout
+            indim=indim,
+            hidden_dim=llm_hidden,
+            n_layers=llm_layers,
+            n_heads=llm_heads,
+            dropout=llm_dropout
         )
 
         self.conv0 = GCNConv(indim, hidden)
@@ -274,7 +289,7 @@ class GCN_Gater_Pool_Reg(nn.Module):
         self.conv1 = GCNConv(hidden, hidden)
         self.bn1 = nn.BatchNorm1d(hidden)
 
-        self.pool1 = HCGPool(hidden, num_clusters=num_clusters, temp=pool_temp)
+        self.pool1 = HCGPool(hidden, num_clusters=self.num_clusters, temp=pool_temp)
 
         self.conv2 = GCNConv(hidden, hidden)
         self.bn2 = nn.BatchNorm1d(hidden)
@@ -319,12 +334,22 @@ class GCN_Gater_Pool_Reg(nn.Module):
         x_out = F.relu(self.bn_fc1(self.fc1(x_readout)))
         x_out = F.dropout(x_out, p=self.dropout_p, training=self.training)
         x_out = self.fc2(x_out)
-        return F.log_softmax(x_out, dim=-1), s_matrix, x_conv, gate   # 返回: output, s_matrix, x_conv, gate
+        output = F.log_softmax(x_out, dim=-1)
+
+        return output, s_matrix, x_conv, gate   # 返回: output, s_matrix, x_conv, gate
 
 
 # ======================= 损失函数 =======================
 
 def cluster_reg_loss(x_conv, s_matrix, edge_index, batch, num_clusters, spec_k):
+    """
+    聚类正则化损失，包含:
+      loss_link   : 链路预测损失（保持图结构）
+      entropy     : 软分配熵（集中性）
+      loss_orth   : 正交损失（S^T S ≈ I）
+      loss_balance: 均衡损失（各超节点分配均匀）
+      loss_spec   : 谱正则（软分配近似谱嵌入）
+    """
     device = s_matrix.device
     adj = to_dense_adj(edge_index, batch)
     if adj.dim() == 2:
@@ -453,37 +478,41 @@ def set_seed(seed):
 # ======================= 参数解析 =======================
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='ADHD Graph Classification Ablation')
+    parser = argparse.ArgumentParser(description='OpenNeuro Graph Classification Ablation')
     parser.add_argument('--epoch', type=int, default=0)
     parser.add_argument('--n_epochs', type=int, default=50)
-    parser.add_argument('--batchSize', type=int, default=137)   # ADHD: 137 ROI
+    parser.add_argument('--batchSize', type=int, default=32)
     parser.add_argument('--dataroot', type=str,
-                        default='/share/home/u24666550/graph_classify/gnn/BrainGNN_Pytorch-adhd/data/ABIDE_pcp/cpac/filt_noglobal')
+                        default='/home/wangyuxuan/BrainGNN/BrainGNN_Pytorch-wmrc/data/ABIDE_pcp/cpac/filt_noglobal')
     parser.add_argument('--fold', type=int, default=1)
     parser.add_argument('--lr', type=float, default=0.0008)
     parser.add_argument('--stepsize', type=int, default=20)
     parser.add_argument('--gamma', type=float, default=0.5)
     parser.add_argument('--weightdecay', type=float, default=2e-5)
 
-    parser.add_argument('--lamb0', type=float, default=1.0)
-    parser.add_argument('--lamb_cluster', type=float, default=0.008)
-    parser.add_argument('--lamb_spec', type=float, default=0.001)
-    parser.add_argument('--spec_k', type=int, default=3)
+    parser.add_argument('--lamb0', type=float, default=1.0,
+                        help='分类损失权重')
+    parser.add_argument('--lamb_cluster', type=float, default=0.008,
+                        help='link+entropy 损失权重')
+    parser.add_argument('--lamb_spec', type=float, default=0.001,
+                        help='谱正则损失权重')
+    parser.add_argument('--spec_k', type=int, default=9,
+                        help='谱正则使用的特征向量数')
 
-    parser.add_argument('--indim', type=int, default=137)       # ADHD: 137 ROI
-    parser.add_argument('--nroi', type=int, default=137)
+    parser.add_argument('--indim', type=int, default=182)
+    parser.add_argument('--nroi', type=int, default=182)
     parser.add_argument('--nclass', type=int, default=2)
     parser.add_argument('--load_model', type=bool, default=False)
     parser.add_argument('--save_model', type=bool, default=True)
     parser.add_argument('--optim', type=str, default='Adam')
     parser.add_argument('--save_path', type=str,
-                        default='./model_adhd_ablation_randomsplit/')
+                        default='./model_openneuro_ablation_randomsplit/')
 
     parser.add_argument('--p_edge_dropout', type=float, default=0.2)
     parser.add_argument('--p_feat_mask', type=float, default=0.2)
-    parser.add_argument('--num_clusters', type=int, default=8)
+    parser.add_argument('--num_clusters', type=int, default=9)
 
-    # 新消融顺序（与 p_ab2.py 一致）
+    # 新消融顺序
     parser.add_argument('--model_type', type=str, default='gcn_gater_pool_reg',
                         choices=['baseline', 'gcn_gater', 'gcn_pool_reg', 'gcn_gater_pool_reg'])
 
@@ -498,10 +527,11 @@ def parse_args():
 
 def build_model(opt):
     """
-    M0 baseline           — 纯 GCN
-    M1 gcn_gater          — GCN + Gater
-    M2 gcn_pool_reg       — GCN + HCGPool + Reg（无 Gater）
-    M3 gcn_gater_pool_reg — GCN + Gater + HCGPool + Reg
+    消融顺序:
+    M0 baseline          — 纯 GCN
+    M1 gcn_gater         — GCN + Gater
+    M2 gcn_pool_reg      — GCN + HCGPool + Reg（无 Gater）
+    M3 gcn_gater_pool_reg— GCN + Gater + HCGPool + Reg
     """
     if opt.model_type == 'baseline':
         model = BaselineGCN(opt.indim, opt.nclass).to(device)
@@ -516,15 +546,22 @@ def build_model(opt):
         model = GCN_Pool_Reg(
             opt.indim, opt.nclass,
             num_clusters=opt.num_clusters,
-            dropout=0.65, hidden=64, pool_temp=1.0,
+            dropout=0.65,
+            hidden=64,
+            pool_temp=1.0,
         ).to(device)
 
     elif opt.model_type == 'gcn_gater_pool_reg':
         model = GCN_Gater_Pool_Reg(
             opt.indim, opt.nclass,
             num_clusters=opt.num_clusters,
-            dropout=0.65, hidden=64, pool_temp=1.0,
-            llm_hidden=96, llm_layers=1, llm_heads=2, llm_dropout=0.5,
+            dropout=0.65,
+            hidden=64,
+            pool_temp=1.0,
+            llm_hidden=96,
+            llm_layers=1,
+            llm_heads=2,
+            llm_dropout=0.5,
         ).to(device)
 
     else:
@@ -541,7 +578,7 @@ def run_single_experiment(run_idx, base_seed, dataset, opt):
 
     total = len(dataset)
     test_n = max(1, int(total * opt.test_size))
-    val_n  = max(1, int(total * opt.val_size))
+    val_n = max(1, int(total * opt.val_size))
     train_n = total - val_n - test_n
     lengths = [train_n, val_n, test_n]
     if sum(lengths) < total:
@@ -567,20 +604,21 @@ def run_single_experiment(run_idx, base_seed, dataset, opt):
 
     scheduler = lr_scheduler.StepLR(optimizer, step_size=opt.stepsize, gamma=opt.gamma)
 
-    # ---------- 辅助：pool+reg 损失（M2/M3 共用）----------
+    # ---------- 辅助：计算 pool+reg 损失（M2/M3 共用）----------
     def compute_reg_loss(s_matrix, x_conv, edge_index_orig, batch_orig):
         losses_dict, _, _ = cluster_reg_loss(
             x_conv, s_matrix, edge_index_orig, batch_orig,
             num_clusters=opt.num_clusters, spec_k=opt.spec_k
         )
         loss_cluster_base = losses_dict['loss_link'] + 0.5 * losses_dict['entropy']
-        return (opt.lamb_cluster * loss_cluster_base
-                + 0.015 * losses_dict['loss_orth']
-                + 0.002 * losses_dict['loss_balance']
-                + opt.lamb_spec * losses_dict['loss_spec'])
+        loss_reg = (opt.lamb_cluster * loss_cluster_base
+                    + 0.015 * losses_dict['loss_orth']
+                    + 0.002 * losses_dict['loss_balance']
+                    + opt.lamb_spec * losses_dict['loss_spec'])
+        return loss_reg
 
-    # ---------- 统一前向，返回 (output, s_matrix, x_conv, gate)，缺失项用 None ----------
-    def forward_model(x, edge_index, batch, edge_attr, pos):
+    # ---------- 前向推理，统一返回 (output, s_matrix_or_None, x_conv_or_None, gate_or_None) ----------
+    def forward_model(model, x, edge_index, batch, edge_attr, pos):
         mt = opt.model_type
         if mt == 'baseline':
             output = model(x, edge_index, batch, edge_attr, pos)
@@ -597,7 +635,7 @@ def run_single_experiment(run_idx, base_seed, dataset, opt):
         else:
             raise ValueError(f"Unknown model_type: {mt}")
 
-    # ---------- 统一 loss 计算 ----------
+    # ---------- 计算总 loss ----------
     def compute_loss(output, s_matrix, x_conv, gate, edge_index_orig, batch_orig, y):
         mt = opt.model_type
         loss_c = F.nll_loss(output, y)
@@ -629,6 +667,7 @@ def run_single_experiment(run_idx, base_seed, dataset, opt):
             data = data.to(device)
             optimizer.zero_grad()
 
+            # 数据增强
             ei_aug, ea_aug = drop_edges(data.edge_index, data.edge_attr, opt.p_edge_dropout)
             x_aug = data.x.clone()
             if opt.p_feat_mask > 0:
@@ -636,8 +675,8 @@ def run_single_experiment(run_idx, base_seed, dataset, opt):
                 x_aug[mask_nodes] = 0.0
 
             output, s_matrix, x_conv, gate = forward_model(
-                x_aug, ei_aug, data.batch, ea_aug, data.pos)
-            # reg loss 使用原始 edge_index（未 dropout）
+                model, x_aug, ei_aug, data.batch, ea_aug, data.pos)
+            # 注意：reg loss 用原始 edge_index（未 dropout），与原代码一致
             loss = compute_loss(output, s_matrix, x_conv, gate,
                                 data.edge_index, data.batch, data.y)
 
@@ -656,12 +695,12 @@ def run_single_experiment(run_idx, base_seed, dataset, opt):
             for data in loader:
                 data = data.to(device)
                 output, _, _, _ = forward_model(
-                    data.x, data.edge_index, data.batch, data.edge_attr, data.pos)
+                    model, data.x, data.edge_index, data.batch, data.edge_attr, data.pos)
                 pred = output.max(dim=1)[1]
                 correct += pred.eq(data.y).sum().item()
         return correct / len(loader.dataset)
 
-    # ---------- 评估 loss（early stopping 用）----------
+    # ---------- 评估 loss（用于 early stopping）----------
     def eval_loss(loader):
         model.eval()
         loss_all = 0
@@ -669,7 +708,7 @@ def run_single_experiment(run_idx, base_seed, dataset, opt):
             for data in loader:
                 data = data.to(device)
                 output, s_matrix, x_conv, gate = forward_model(
-                    data.x, data.edge_index, data.batch, data.edge_attr, data.pos)
+                    model, data.x, data.edge_index, data.batch, data.edge_attr, data.pos)
                 loss = compute_loss(output, s_matrix, x_conv, gate,
                                     data.edge_index, data.batch, data.y)
                 loss_all += loss.item() * data.num_graphs
@@ -679,8 +718,8 @@ def run_single_experiment(run_idx, base_seed, dataset, opt):
     best_model_wts = copy.deepcopy(model.state_dict())
     best_loss = 1e10
     for epoch in range(opt.epoch, opt.n_epochs):
-        tr_loss  = train_one_epoch(epoch)
-        tr_acc   = eval_acc(train_loader)
+        tr_loss = train_one_epoch(epoch)
+        tr_acc  = eval_acc(train_loader)
         val_acc  = eval_acc(val_loader)
         val_loss = eval_loss(val_loader)
         logger.info(f"Run {run_idx+1}, Epoch {epoch:03d}, "
@@ -695,13 +734,15 @@ def run_single_experiment(run_idx, base_seed, dataset, opt):
     model.eval()
 
     # ---------- 测试集推理 ----------
-    all_probs_list, all_preds_list, all_trues_list = [], [], []
+    all_probs_list = []
+    all_preds_list = []
+    all_trues_list = []
 
     with torch.no_grad():
         for data in test_loader:
             data = data.to(device)
             output, _, _, _ = forward_model(
-                data.x, data.edge_index, data.batch, data.edge_attr, data.pos)
+                model, data.x, data.edge_index, data.batch, data.edge_attr, data.pos)
 
             prob = F.softmax(output, dim=1)[:, 1]
             pred = output.max(1)[1]
@@ -742,7 +783,7 @@ def main():
     ch = logging.StreamHandler()
     ch.setLevel(logging.INFO)
     ch.setFormatter(fmt)
-    fh = logging.FileHandler('adhd_ablation_randomsplit_10runs_stats.log', encoding='utf-8')
+    fh = logging.FileHandler('openneuro_ablation_randomsplit_10runs_stats_k8.log', encoding='utf-8')
     fh.setLevel(logging.INFO)
     fh.setFormatter(fmt)
     logger.addHandler(ch)
@@ -755,7 +796,7 @@ def main():
         os.makedirs(opt.save_path, exist_ok=True)
 
     path = opt.dataroot
-    name = 'ADHD'   # 数据集标识
+    name = 'OpenNeuro'   # 数据集标识（注：实际加载逻辑由 ABIDEDataset 类决定）
     dataset = ABIDEDataset(path, name)
     dataset.data.y = dataset.data.y.squeeze()
     dataset.data.x[dataset.data.x == float('inf')] = 0
